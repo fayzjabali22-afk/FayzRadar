@@ -1,0 +1,370 @@
+import { NextRequest, NextResponse } from 'next/server';
+
+import {
+  extractGoogleMapsPlaceName,
+  isGoogleMapsLink,
+  parseGoogleMapsLocation,
+  sanitizeGoogleMapsUrl,
+} from '@/shared/services/google-maps-location';
+import { calculateHaversineKm } from '@/lib/road-route';
+
+const MAX_REDIRECTS = 6;
+const REQUEST_TIMEOUT_MS = 5_000;
+
+/**
+ * How far the coordinate we extracted may sit from where the place NAME in the same link
+ * geocodes to before we stop trusting the extraction.
+ *
+ * This is the guard for the failure that actually bit us: a link for "مول العرب" that
+ * resolved to a point ~15 km away, priced as a real trip because nothing ever asked whether
+ * the coordinate and the name agreed. A distance cap cannot catch that — the wrong point was
+ * a perfectly ordinary distance away. Two independent readings of the same link disagreeing
+ * is the only signal that does.
+ *
+ * 3 km is wide enough for the normal case (a mall's geocoded centroid vs. its car-park pin,
+ * a road-name match landing mid-street) and far narrower than a wrong-point error.
+ */
+const PLACE_NAME_MISMATCH_KM = 3;
+
+function isValidLocation(lat: number, lng: number) {
+  return (
+    Number.isFinite(lat)
+    && Number.isFinite(lng)
+    && Math.abs(lat) <= 90
+    && Math.abs(lng) <= 180
+    && !(lat === 0 && lng === 0)
+  );
+}
+
+export async function GET(request: NextRequest) {
+  const rawUrl = request.nextUrl.searchParams.get('url')?.trim() || '';
+  const shortUrl = sanitizeGoogleMapsUrl(rawUrl);
+  if (!isGoogleMapsLink(shortUrl)) {
+    return NextResponse.json({ error: 'invalid_maps_url' }, { status: 400 });
+  }
+
+  try {
+    const directLocation = parseGoogleMapsLocation(shortUrl);
+    const resolvedUrl = directLocation ? shortUrl : await followGoogleMapsRedirects(shortUrl);
+    let location = directLocation || parseGoogleMapsLocation(resolvedUrl);
+
+    // A Google short link may resolve to a place URL without coordinates in
+    // the address. Fetch the final page and inspect its map bootstrap payload.
+    if (!location) {
+      location = await readGoogleMapsPageLocation(resolvedUrl);
+    }
+
+    // If coordinates are still missing, attempt cascading locality geocode:
+    if (!location) {
+      const fallback = await geocodePlaceName(resolvedUrl);
+      if (fallback) {
+        location = { lat: fallback.lat, lng: fallback.lng };
+      }
+    }
+
+    if (!location) {
+      return NextResponse.json(
+        { error: 'coordinates_not_found', resolvedUrl: sanitizeGoogleMapsUrl(resolvedUrl) },
+        { status: 422 },
+      );
+    }
+
+    const placeNameCheck = await crossCheckPlaceName(resolvedUrl, location);
+    // We deliberately do not override the parsed location with the geocoded location here,
+    // even if they are drastically mismatched. Nominatim's global search can return a place
+    // on the other side of the world for generic names like "KFC" or "Dubai Mall", and
+    // overriding the explicit URL coordinate with Nominatim's guess causes wrong addresses.
+
+    const geography = await reverseResolveGeography(location);
+    return NextResponse.json({ resolvedUrl, location, geography, placeNameCheck });
+    return NextResponse.json({
+      resolvedUrl: sanitizeGoogleMapsUrl(resolvedUrl),
+      location,
+      geography,
+      placeNameCheck,
+    });
+  } catch {
+    return NextResponse.json({ error: 'maps_link_resolution_failed' }, { status: 502 });
+  }
+}
+
+async function followGoogleMapsRedirects(initialUrl: string) {
+  let currentUrl = initialUrl;
+
+  for (let redirectCount = 0; redirectCount < MAX_REDIRECTS; redirectCount += 1) {
+    const response = await fetch(currentUrl, {
+      method: 'GET',
+      redirect: 'manual',
+      cache: 'no-store',
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      headers: {
+        Accept: 'text/html,application/xhtml+xml',
+        'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Cookie: 'SOCS=CAESHAgBEhJnd3NfMjAyNDA5MjQtMF9SQzIaAmVuIAEaBgiA_LyuBg; NID=511',
+      },
+    });
+    const locationHeader = response.headers.get('location');
+    if (!locationHeader) return response.url || currentUrl;
+
+    const nextUrl = new URL(locationHeader, currentUrl);
+    // Google Maps redirects European / US requests to consent.google.com when cookies are absent.
+    // If redirected to consent, extract the target destination URL from the ?continue= parameter.
+    if (nextUrl.hostname.toLowerCase().startsWith('consent.')) {
+      const continueTarget = nextUrl.searchParams.get('continue');
+      if (continueTarget) {
+        try {
+          const parsedContinue = new URL(continueTarget);
+          if (isAllowedRedirectHost(parsedContinue.hostname)) {
+            currentUrl = parsedContinue.toString();
+            continue;
+          }
+        } catch {
+          // ignore parsing error and return currentUrl fallback
+        }
+      }
+      return currentUrl;
+    }
+    if (!isAllowedRedirectHost(nextUrl.hostname)) {
+      throw new Error('disallowed_redirect_host');
+    }
+    currentUrl = nextUrl.toString();
+  }
+
+  throw new Error('too_many_redirects');
+}
+
+async function readGoogleMapsPageLocation(url: string) {
+  const response = await fetch(url, {
+    method: 'GET',
+    redirect: 'follow',
+    cache: 'no-store',
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    headers: {
+      Accept: 'text/html,application/xhtml+xml',
+      'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      Cookie: 'SOCS=CAESHAgBEhJnd3NfMjAyNDA5MjQtMF9SQzIaAmVuIAEaBgiA_LyuBg; NID=511',
+    },
+  });
+
+  if (!response.ok) return null;
+  const html = await response.text();
+
+  // 1. Google's internal place preview endpoint (highest fidelity for true place pin)
+  // Google place pages include: <link href="/maps/preview/place?authuser=0&hl=ar&gl=eg&q=...&pb=...">
+  // which returns the actual place coordinates [[..., lng, lat], ...] regardless of caller GeoIP or map viewport.
+  const previewMatch = /href=["'](\/maps\/preview\/place[^"']+)["']/i.exec(html);
+  if (previewMatch && previewMatch[1]) {
+    const previewPath: string = previewMatch[1];
+    try {
+      const previewUrl = 'https://www.google.com' + previewPath.replace(/&amp;/g, '&');
+      const prevResponse = await fetch(previewUrl, {
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          Cookie: 'SOCS=CAESHAgBEhJnd3NfMjAyNDA5MjQtMF9SQzIaAmVuIAEaBgiA_LyuBg; NID=511',
+        },
+      });
+      if (prevResponse.ok) {
+        const prevText = await prevResponse.text();
+        const coordMatch = prevText.match(
+          /\[\[\s*[\d.]+\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]/,
+        );
+        const lngStr = coordMatch?.[1];
+        const latStr = coordMatch?.[2];
+        if (lngStr && latStr) {
+          const lng = Number(lngStr);
+          const lat = Number(latStr);
+          if (isValidLocation(lat, lng)) {
+            return { lat, lng };
+          }
+        }
+      }
+    } catch {
+      // preview fetch failed, continue to fallback
+    }
+  }
+
+  // 2. Direct coordinate markers inside HTML (!3d, !4d) as fallback
+  const direct = parseGoogleMapsLocation(html);
+  if (direct) return direct;
+
+  return null;
+}
+
+/**
+ * Geocodes the place name using Nominatim with cascading locality fallback:
+ * tries full clean place name, then drops specific venue and tries the district/governorate.
+ */
+async function geocodePlaceName(resolvedUrl: string, locationHint?: { lat: number; lng: number }) {
+  const rawPlaceName = extractGoogleMapsPlaceName(resolvedUrl);
+  if (!rawPlaceName) return null;
+
+  const cleanName = rawPlaceName.replace(/^[A-Z0-9]{2,8}\+[A-Z0-9]{2,4}\s*[-–—,]?\s*/i, '').trim();
+  if (!cleanName || /^-?\d+(\.\d+)?,\s*-?\d+(\.\d+)?$/.test(cleanName)) return null;
+
+  const segments = cleanName.split(',').map((s) => s.trim()).filter(Boolean);
+  const candidateQueries = [cleanName];
+  if (segments.length > 1) {
+    candidateQueries.push(segments.slice(1).join(', '));
+  }
+  if (segments.length > 2) {
+    candidateQueries.push(segments.slice(2).join(', '));
+  }
+
+  for (const q of candidateQueries) {
+    try {
+      const params = new URLSearchParams({
+        format: 'jsonv2',
+        q,
+        limit: '1',
+        'accept-language': 'ar,en',
+      });
+      if (locationHint) {
+        // Use a ~50km bounding box to strongly bias Nominatim toward the region of the coordinate.
+        // x1,y1,x2,y2 -> left,top,right,bottom -> lng1,lat1,lng2,lat2
+        const viewbox = `${locationHint.lng - 0.5},${locationHint.lat + 0.5},${locationHint.lng + 0.5},${locationHint.lat - 0.5}`;
+        params.set('viewbox', viewbox);
+        // We don't use bounded=1 because we still want fallback to global if it's completely unmatched,
+        // but viewbox alone strongly biases results.
+      }
+      const response = await fetch(`https://nominatim.openstreetmap.org/search?${params.toString()}`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(3_000),
+        headers: { Accept: 'application/json', 'User-Agent': 'RadarLocationResolver/1.0' },
+      });
+      if (!response.ok) continue;
+
+      const [match] = await response.json() as Array<{ lat?: string; lon?: string }>;
+      const lat = Number(match?.lat);
+      const lng = Number(match?.lon);
+      if (isValidLocation(lat, lng)) {
+        return { lat, lng, placeName: cleanName };
+      }
+    } catch {
+      // continue to broader query
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Second, independent reading of the same link: geocode the place NAME and see whether it
+ * lands near the coordinate we extracted.
+ *
+ * Returns null when there is nothing to compare (no name in the URL, or the geocoder had no
+ * answer). A null is "unknown", never "verified" — the caller must not treat it as a pass.
+ */
+async function crossCheckPlaceName(
+  resolvedUrl: string,
+  location: { lat: number; lng: number },
+) {
+  const rawPlaceName = extractGoogleMapsPlaceName(resolvedUrl);
+  const placeName = rawPlaceName?.replace(/^[A-Z0-9]{2,8}\+[A-Z0-9]{2,4}\s*[-–—,]?\s*/i, '').trim() || null;
+  // A bare coordinate link has no name to check against, and a name that is itself just
+  // coordinates would only be comparing the extraction with itself.
+  if (!placeName || /^-?\d+(\.\d+)?,\s*-?\d+(\.\d+)?$/.test(placeName)) return null;
+  const geocoded = await geocodePlaceName(resolvedUrl, location);
+  if (!geocoded) return null;
+
+  const distanceKm = calculateHaversineKm(location, { lat: geocoded.lat, lng: geocoded.lng });
+
+  return {
+    placeName: geocoded.placeName,
+    geocodedLocation: { lat: geocoded.lat, lng: geocoded.lng },
+    distanceKm: Number(distanceKm.toFixed(2)),
+    isMismatch: distanceKm > PLACE_NAME_MISMATCH_KM,
+  };
+}
+
+async function reverseResolveGeography(location: { lat: number; lng: number }) {
+  try {
+    const params = new URLSearchParams({
+      format: 'jsonv2',
+      lat: String(location.lat),
+      lon: String(location.lng),
+      zoom: '18',
+      addressdetails: '1',
+      'accept-language': 'ar,en',
+    });
+    const response = await fetch(`https://nominatim.openstreetmap.org/reverse?${params.toString()}`, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(3_000),
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'RadarLocationResolver/1.0',
+      },
+    });
+    if (!response.ok) return undefined;
+
+    const payload = await response.json() as { address?: Record<string, unknown> };
+    const address = payload.address || {};
+    const governorateCandidates = addressValues(
+      address,
+      'state',
+      'region',
+      'province',
+      'state_district',
+    );
+    const districtCandidates = addressValues(
+      address,
+      'neighbourhood',
+      'suburb',
+      'quarter',
+      'borough',
+      'city_district',
+      'district',
+      'municipality',
+      'county',
+      'city',
+      'town',
+      'village',
+      'hamlet',
+    );
+    return {
+      governorate: governorateCandidates[0] || null,
+      // Was a separate, narrower list (county/municipality/city_district/suburb only) that
+      // left out `neighbourhood` and `hamlet` — the two fields OSM actually tags most small
+      // and old-city areas with (e.g. El-Gamaleya in Cairo has neither a suburb nor a
+      // city_district tag, only a neighbourhood one). That gap meant `district` silently
+      // fell through to `city` for exactly the residential-area case it exists to handle,
+      // showing "Cairo - Cairo" instead of the real neighbourhood. `districtCandidates`
+      // below was already the correct, complete priority order — reuse it here instead of
+      // maintaining two different lists that can (and did) disagree.
+      district: districtCandidates[0] || null,
+      city: firstAddressValue(address, 'city', 'town', 'village', 'municipality'),
+      governorateCandidates,
+      districtCandidates,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function firstAddressValue(address: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    const value = address[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function addressValues(address: Record<string, unknown>, ...keys: string[]) {
+  return keys
+    .map((key) => address[key])
+    .filter((value): value is string => typeof value === 'string' && Boolean(value.trim()))
+    .map((value) => value.trim())
+    .filter((value, index, values) => values.indexOf(value) === index);
+}
+
+function isAllowedRedirectHost(hostname: string) {
+  const normalized = hostname.toLowerCase();
+  return (
+    normalized === 'maps.app.goo.gl'
+    || normalized === 'goo.gl'
+    || normalized === 'google.com'
+    || normalized.endsWith('.google.com')
+  );
+}

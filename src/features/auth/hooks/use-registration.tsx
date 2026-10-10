@@ -1,0 +1,721 @@
+'use client';
+
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useRouter } from 'next/navigation';
+import type { AffiliationType } from '@/core/types';
+import { buildRiderSignUpMetadata, isInvalidPhoneOrPasswordError, mapSupabaseAuthError, signInRiderWithPhone, signUpRiderWithPhone } from '../services/supabase-auth';
+import { shouldRememberSupabaseSession, supabase } from '@/lib/supabase-client';
+import { useDashboardLanguage } from '@/hooks/use-dashboard-language';
+import { useToast } from '@/hooks/use-toast';
+import {
+  useSupabaseCountries,
+  getCountryDialCode,
+  getCountryIsoCode,
+  type SupabaseCountryRow,
+} from './use-supabase-countries';
+import {
+  useSupabaseGovernorates,
+  useSupabaseDistricts,
+  normalizeGovernorates,
+  normalizeDistricts,
+  type SupabaseGovernorateRow,
+  type SupabaseDistrictRow,
+} from './use-supabase-locations';
+import { useDetectedCountryCode } from './use-detected-country-code';
+import { parsePhoneNumberFromString, getExampleNumber, type CountryCode } from 'libphonenumber-js';
+import phoneNumberExamples from 'libphonenumber-js/mobile/examples';
+import { useTranslations } from "next-intl";
+
+const styles = {
+  root: "",
+} as const;
+
+
+/**
+ * Must be the literal `process.env.NODE_ENV` expression. Bundlers replace exactly that text
+ * at build time; anything reached dynamically — `globalThis.process?.env?.NODE_ENV` — is left
+ * as a runtime lookup, and there is no `process` object in a browser. So the previous version
+ * was TRUE during the server render and FALSE on the client, and the dev-only mock-data block
+ * it gates rendered into the SSR HTML and then vanished during hydration:
+ *
+ *   Hydration failed because the server rendered HTML didn't match the client.
+ *
+ * `import.meta.env` is Vite's API and is empty here — leftover from the dead Vite SPA
+ * (see CLAUDE.md), so both of the first two checks were always false anyway.
+ */
+const isStrictDevelopment = process.env.NODE_ENV === 'development';
+
+type RegistrationStep = 'role' | 'personal' | 'affiliation' | 'vehicle' | 'admin' | 'advertiser' | 'ProfessionalStep';
+type RegistrationRole = 'rider' | 'driver' | 'advertiser' | 'delegate' | null;
+type AuthMode = 'register' | 'login';
+type LocationOption = { id: string; label: string; labelEn: string; value: string };
+
+interface PersonalRegistrationState {
+  name: string;
+  phone: string;
+  email: string;
+  country: string;
+  gov: string;
+  district: string;
+  verificationDoc: string;
+}
+
+interface RegistrationContextType {
+  step: RegistrationStep;
+  setStep: (step: RegistrationStep) => void;
+  role: RegistrationRole;
+  setRole: (role: RegistrationRole) => void;
+  authMode: AuthMode;
+  setAuthMode: (mode: AuthMode) => void;
+  lang: 'ar' | 'en';
+  setLang: (lang: 'ar' | 'en') => void;
+  personal: PersonalRegistrationState;
+  setPersonal: (personal: PersonalRegistrationState | ((current: PersonalRegistrationState) => PersonalRegistrationState)) => void;
+  authPassword: string;
+  setAuthPassword: (password: string) => void;
+  rememberMe: boolean;
+  setRememberMe: (remember: boolean) => void;
+  advertiserProfile: { companyName: string; commercialRegister: string; adLicense: string; businessType: string };
+  setAdvertiserProfile: (profile: any) => void;
+  affiliation: AffiliationType | null;
+  setAffiliation: (affiliation: any) => void;
+  vehicle: any;
+  setVehicle: (vehicle: any) => void;
+  isSubmitting: boolean;
+  locationDataLoading: boolean;
+  countries: LocationOption[];
+  selectedCountry: SupabaseCountryRow | null;
+  phonePlaceholder: string;
+  phoneValidationHint: string;
+  governorates: LocationOption[];
+  districts: LocationOption[];
+  canUseDevMockData: boolean;
+  fillRandomRegistrationData: () => void;
+  fillCaptainRegistrationData: () => void;
+  handlePersonalSubmit: (e: React.FormEvent) => void;
+  handleVehicleSubmit: (e: React.FormEvent) => void;
+  handleAdvertiserSubmit: (e: React.FormEvent) => void;
+  adminCreds: any;
+  setAdminCreds: (creds: any) => void;
+  handleAdminSubmit: (e: React.FormEvent) => void;
+  handleLogoTap: () => void;
+  // Bumped whenever a login attempt fails with a wrong phone/password, so the
+  // "create a new account" link can replay its attention animation — see
+  // PersonalStep, where the link's `key` is tied to this value.
+  createAccountPulseKey: number;
+}
+
+const RegistrationContext = createContext<RegistrationContextType | undefined>(undefined);
+
+export function RegistrationProvider({ children }: { children: ReactNode }) {
+    const tAuto = useTranslations('auto');
+  const router = useRouter();
+  const { toast } = useToast();
+  const [step, setStep] = useState<RegistrationStep>('role');
+  const [role, setRole] = useState<RegistrationRole>(null);
+  const [authMode, setAuthMode] = useState<AuthMode>('register');
+  // Language is owned by the shared LocaleProvider (persisted + synced app-wide),
+  // so the auth/home flow and the role dashboards always agree on the language.
+  const { language: lang, setLanguage: setLang } = useDashboardLanguage();
+  const [personal, setPersonal] = useState<PersonalRegistrationState>({
+    name: '',
+    phone: '',
+    email: '',
+    country: '',
+    gov: '',
+    district: '',
+    verificationDoc: '',
+  });
+  const [authPassword, setAuthPassword] = useState('');
+  // Keep the first SSR/client render identical. Browser storage is hydrated
+  // after mount so the remember-me preference cannot cause a hydration diff.
+  const [rememberMe, setRememberMe] = useState(false);
+  const [advertiserProfile, setAdvertiserProfile] = useState({ companyName: '', commercialRegister: '', adLicense: '', businessType: 'commercial' });
+  const [affiliation, setAffiliation] = useState<AffiliationType | null>(null);
+  const [vehicle, setVehicle] = useState({ year: '', plate: '', sideId: '', make: '', color: '', officeName: '', officePhone: '', companyName: '' });
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [createAccountPulseKey, setCreateAccountPulseKey] = useState(0);
+  const [logoTapCount, setLogoTapCount] = useState(0);
+  const [adminCreds, setAdminCreds] = useState({ email: '', password: '' });
+  const [selectedCountry, setSelectedCountry] = useState<SupabaseCountryRow | null>(null);
+  const detectedCountryCode = useDetectedCountryCode();
+
+  const { countryRows, loading: countriesLoading } = useSupabaseCountries({
+    onError: () =>
+      toast({
+        variant: 'destructive',
+        title: tAuto('key_2a3ac6a0'),
+        description: tAuto('key_4a1a36ba'),
+      }),
+  });
+  const countryIdNum = Number(personal.country) || null;
+  const governorateIdNum = Number(personal.gov) || null;
+  const { governorateRows, loading: governoratesLoading } = useSupabaseGovernorates(countryIdNum, {
+    onError: () =>
+      toast({
+        variant: 'destructive',
+        title: tAuto('key_64ee8ed7'),
+        description: tAuto('key_4966bf15'),
+      }),
+  });
+  const { districtRows, loading: districtsLoading } = useSupabaseDistricts(governorateIdNum, {
+    onError: () =>
+      toast({
+        variant: 'destructive',
+        title: tAuto('key_ae97e002'),
+        description: tAuto('key_9a947721'),
+      }),
+  });
+  const isSubmittingRef = useRef(false);
+
+  const locationDataLoading = countriesLoading || governoratesLoading || districtsLoading;
+
+  useEffect(() => {
+    setRememberMe(shouldRememberSupabaseSession());
+  }, []);
+
+  useEffect(() => {
+    const countryId = Number(personal.country);
+    setSelectedCountry(countryRows.find((country) => country.id === countryId) || null);
+  }, [countryRows, personal.country]);
+
+  useEffect(() => {
+    if (personal.country || !detectedCountryCode || countryRows.length === 0) return;
+
+    const detectedCountry = countryRows.find((country) => getCountryIsoCode(country) === detectedCountryCode);
+    if (!detectedCountry) return;
+
+    setPersonal((current) =>
+      current.country ? current : { ...current, country: String(detectedCountry.id), gov: '', district: '' },
+    );
+  }, [countryRows, detectedCountryCode, personal.country]);
+
+  // Clears the dependent fields whenever their parent selection changes; the
+  // rows themselves are fetched by the hooks above, keyed off the same ids.
+  useEffect(() => {
+    setPersonal((current) => (current.gov || current.district ? { ...current, gov: '', district: '' } : current));
+  }, [personal.country]);
+
+  useEffect(() => {
+    setPersonal((current) => (current.district ? { ...current, district: '' } : current));
+  }, [personal.gov]);
+
+  const countries = useMemo(
+    () =>
+      countryRows.map((country) => ({
+        id: String(country.id),
+        label: getLocationLabel(country, 'ar'),
+        labelEn: getLocationLabel(country, 'en'),
+        value: String(country.id),
+      })),
+    [countryRows],
+  );
+
+  const governorates = useMemo(
+    () =>
+      governorateRows.map((governorate) => ({
+        id: String(governorate.id),
+        label: getLocationLabel(governorate, 'ar'),
+        labelEn: getLocationLabel(governorate, 'en'),
+        value: String(governorate.id),
+      })),
+    [governorateRows],
+  );
+
+  const districts = useMemo(
+    () =>
+      districtRows.map((district) => ({
+        id: String(district.id),
+        label: getLocationLabel(district, 'ar'),
+        labelEn: getLocationLabel(district, 'en'),
+        value: String(district.id),
+      })),
+    [districtRows],
+  );
+
+  const phonePlaceholder = useMemo(() => getDemoPhoneForCountry(selectedCountry), [selectedCountry]);
+  const phoneValidationHint =
+    lang === 'ar'
+      ? tAuto('key_1a0de9e5')
+      : "Write your number in your country's local format, or international format if you prefer";
+
+  const fillRandomRegistrationData = useCallback(() => {
+    if (!isStrictDevelopment) return;
+
+    if (!selectedCountry || !personal.gov || districtRows.length === 0) {
+      toast({
+        variant: 'destructive',
+        title: tAuto('key_4e1d745a'),
+        description: tAuto('key_a041f296'),
+      });
+      return;
+    }
+
+    const dialCode = getCountryDialCode(selectedCountry);
+    if (!dialCode) {
+      toast({
+        variant: 'destructive',
+        title: tAuto('key_a644ed7b'),
+        description: tAuto('key_912f6acb'),
+      });
+      return;
+    }
+
+    const randomDistrict = districtRows[Math.floor(Math.random() * districtRows.length)];
+    const serial = String(Date.now()).slice(-6);
+    const demoPhone = getDemoPhoneForCountry(selectedCountry);
+
+    setAuthMode('register');
+    setPersonal((current) => ({
+      ...current,
+      name: `راكب تجربة ${serial}`,
+      phone: demoPhone,
+      email: `test${serial}@example.com`,
+      country: String(selectedCountry.id),
+      gov: personal.gov,
+      district: String(randomDistrict.id),
+    }));
+    setAuthPassword(`Test${serial}!`);
+
+    toast({
+      title: tAuto('key_294a26b3'),
+      description: tAuto('key_38e7e080'),
+    });
+  }, [districtRows, personal.gov, selectedCountry, toast]);
+
+  const fillCaptainRegistrationData = useCallback(async () => {
+    const country =
+      selectedCountry ||
+      countryRows.find((row) => String(row.id) === personal.country) ||
+      countryRows[0] ||
+      null;
+
+    let governorateOptions = governorateRows.filter((row) => row.country_id === country?.id);
+    if (country && governorateOptions.length === 0) {
+      const { data, error } = await supabase
+        .from('governorates')
+        .select('*')
+        .eq('country_id', country.id)
+        .order('id', { ascending: true });
+      if (!error) {
+        governorateOptions = normalizeGovernorates(data);
+      }
+    }
+
+    const governorateId = Number(
+      personal.gov && governorateOptions.some((row) => row.id === Number(personal.gov))
+        ? personal.gov
+        : governorateOptions[0]?.id,
+    );
+
+    let districtOptions = districtRows.filter((district) => district.governorate_id === governorateId);
+    if (Number.isInteger(governorateId) && governorateId > 0 && districtOptions.length === 0) {
+      const { data, error } = await supabase
+        .from('districts')
+        .select('*')
+        .eq('governorate_id', governorateId)
+        .order('id', { ascending: true });
+      if (!error) {
+        districtOptions = normalizeDistricts(data);
+      }
+    }
+
+    const districtId = Number(
+      personal.district && districtOptions.some((row) => row.id === Number(personal.district))
+        ? personal.district
+        : districtOptions[0]?.id,
+    );
+
+    if (!country || !Number.isInteger(governorateId) || !Number.isInteger(districtId)) {
+      toast({
+        variant: 'destructive',
+        title: tAuto('key_7e63a867'),
+        description: tAuto('key_f67ac42d'),
+      });
+      return;
+    }
+
+    const serial = String(Date.now()).slice(-6);
+    const demoPhone = getDemoPhoneForCountry(country);
+    const plateSuffix = serial.slice(-4);
+
+    setAuthMode('register');
+    setRole('driver');
+    setAffiliation(affiliation || 'smart-app');
+    setPersonal((current) => ({
+      ...current,
+      name: `Captain Test ${serial}`,
+      phone: demoPhone,
+      email: `captain${serial}@example.com`,
+      country: String(country.id),
+      gov: String(governorateId),
+      district: String(districtId),
+      verificationDoc: current.verificationDoc || 'dev-captain-license',
+    }));
+    setAuthPassword(`Captain${serial}!`);
+    setVehicle((current: any) => ({
+      ...current,
+      make: 'Toyota Corolla',
+      color: 'black',
+      plate: `TEST-${plateSuffix}`,
+      year: '2022',
+      companyName: 'Smart Radar',
+      officeName: 'Smart Radar Test Office',
+      officePhone: demoPhone,
+      sideId: `D-${plateSuffix}`,
+    }));
+
+    toast({
+      title: tAuto('key_c3d38c4f'),
+      description: tAuto('key_61287ae0'),
+    });
+  }, [
+    affiliation,
+    countryRows,
+    districtRows,
+    governorateRows,
+    personal.country,
+    personal.district,
+    personal.gov,
+    selectedCountry,
+    toast,
+  ]);
+
+  const submitSupabaseAuth = useCallback(async () => {
+    if (isSubmittingRef.current) return;
+
+    const countryId = Number(personal.country);
+    const governorateId = Number(personal.gov);
+    const districtId = Number(personal.district);
+    const selectedGovernorate = governorateRows.find(
+      (governorate) => governorate.id === governorateId && governorate.country_id === countryId,
+    );
+    const selectedDistrict = districtRows.find(
+      (district) => district.id === districtId && district.governorate_id === governorateId,
+    );
+
+    if (!personal.phone || !authPassword) {
+      toast({
+        variant: 'destructive',
+        title: tAuto('key_e1da8e5b'),
+        description: tAuto('key_48c653a4'),
+      });
+      return;
+    }
+
+    const normalizedPhone = normalizePhoneForCountry(personal.phone, selectedCountry, tAuto);
+    if (!normalizedPhone.ok) {
+      toast({
+        variant: 'destructive',
+        title: tAuto('key_c4fdecb8'),
+        description: normalizedPhone.message,
+      });
+      return;
+    }
+
+    if (
+      authMode === 'register' &&
+      (!personal.name.trim() ||
+        !Number.isInteger(countryId) ||
+        !Number.isInteger(governorateId) ||
+        !Number.isInteger(districtId) ||
+        !selectedCountry ||
+        !selectedGovernorate ||
+        !selectedDistrict)
+    ) {
+      toast({
+        variant: 'destructive',
+        title: tAuto('key_e1da8e5b'),
+        description: tAuto('key_97c980d3'),
+      });
+      return;
+    }
+
+    isSubmittingRef.current = true;
+    setIsSubmitting(true);
+
+    try {
+      if (authMode === 'login') {
+        await signInRiderWithPhone({
+          phone: normalizedPhone.phone,
+          password: authPassword,
+          rememberMe,
+          expectedRole: toSupabaseAuthRole(role),
+        });
+
+        toast({
+          title: tAuto('key_93857427'),
+          description: tAuto('key_79708394'),
+        });
+        // Don't push a role-based route directly here: AuthContext may not have
+        // picked up the fresh session yet, which would race this navigation and
+        // land on a route that still sees `user === null`. Go to `/` and let
+        // its effect redirect once `useAuth()` actually reflects the new session.
+        router.replace('/');
+        return;
+      }
+
+      const signUpInput = {
+        phone: normalizedPhone.phone,
+        password: authPassword,
+        fullName: personal.name.trim(),
+        role: toSupabaseAuthRole(role),
+        countryId,
+        governorateId,
+        districtId,
+        rememberMe,
+      };
+
+      if ((process.env.NODE_ENV !== 'production')) {
+        console.info('[Supabase Auth Payload]', {
+          mode: 'register',
+          data: buildRiderSignUpMetadata(signUpInput),
+        });
+      }
+
+      const signUpResult = await signUpRiderWithPhone(signUpInput);
+
+      if (signUpResult.session && personal.email?.trim().includes('@')) {
+        const { error: emailError } = await supabase.auth.updateUser({ email: personal.email.trim() });
+        if (emailError && (process.env.NODE_ENV !== 'production')) {
+          console.warn('[Registration Email Update Error]', emailError);
+        }
+      }
+
+      if (role === 'driver') {
+        const userId = signUpResult.user?.id;
+        if (userId) {
+          const isTaxi = affiliation === 'office-taxi';
+          const { error: profileError } = await supabase.from('captain_profiles').upsert({
+            id: userId,
+            vehicle_type: isTaxi ? tAuto('key_0870671f') : tAuto('key_3e71cbbc'),
+            vehicle_brand: isTaxi ? null : vehicle.make,
+            vehicle_year: Number(vehicle.year) || null,
+            plate_number: vehicle.plate,
+            employment_type: isTaxi ? vehicle.officeName : vehicle.companyName,
+            affiliation_type: affiliation,
+            office_phone: isTaxi ? vehicle.officePhone : null,
+            side_id: isTaxi ? vehicle.sideId : null,
+            identity_url: personal.verificationDoc,
+            verification_status: 'PENDING'
+          });
+
+          if (profileError) {
+            console.error('[Captain Profile Insert Error]', profileError);
+            throw new Error(profileError.message || tAuto('key_643f2795'));
+          }
+        }
+      }
+
+      toast({
+        title: tAuto('key_b4c64c00'),
+        description: role === 'driver'
+          ? tAuto('key_cd6703e6')
+          : tAuto('key_7132f656'),
+      });
+      if (signUpResult.session) {
+        // Same reasoning as the login branch above: let `/` redirect once
+        // AuthContext actually reflects the new session, instead of racing it.
+        router.replace('/');
+      } else {
+        setAuthMode('login');
+        router.replace('/');
+      }
+    } catch (error) {
+      if ((process.env.NODE_ENV !== 'production')) {
+        const authError = error as { name?: string; code?: string; status?: number; message?: string };
+        console.warn('[Supabase Auth]', {
+          mode: authMode,
+          role,
+          name: authError?.name,
+          code: authError?.code,
+          status: authError?.status,
+          message: authError?.message,
+        });
+      }
+
+      const wrongCredentials = authMode === 'login' && isInvalidPhoneOrPasswordError(error);
+      if (wrongCredentials) setCreateAccountPulseKey((key) => key + 1);
+
+      toast({
+        variant: 'destructive',
+        title: authMode === 'register' ? tAuto('key_71272649') : tAuto('key_64bc4896'),
+        description: wrongCredentials
+          ? `${mapSupabaseAuthError(error)} يمكنك إنشاء حساب جديد إذا لم يكن لديك حساب بعد.`
+          : mapSupabaseAuthError(error),
+      });
+    } finally {
+      setIsSubmitting(false);
+      isSubmittingRef.current = false;
+    }
+  }, [
+    affiliation,
+    authMode,
+    authPassword,
+    districtRows,
+    governorateRows,
+    personal.country,
+    personal.district,
+    personal.gov,
+    personal.name,
+    personal.phone,
+    personal.verificationDoc,
+    rememberMe,
+    role,
+    router,
+    selectedCountry,
+    toast,
+    vehicle,
+  ]);
+
+  const handlePersonalSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    void submitSupabaseAuth();
+  };
+  const handleVehicleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    void submitSupabaseAuth();
+  };
+  const handleAdvertiserSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    toast({
+      variant: 'destructive',
+      title: tAuto('key_002904c4'),
+      description: tAuto('key_dea165fb'),
+    });
+  };
+
+  const handleLogoTap = () => {
+    const newCount = logoTapCount + 1;
+    setLogoTapCount(newCount);
+    if (newCount >= 5) {
+      setStep('admin');
+      setLogoTapCount(0);
+    }
+  };
+
+  const handleAdminSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    toast({
+      variant: 'destructive',
+      title: tAuto('key_002904c4'),
+      description: tAuto('key_91e1ce75'),
+    });
+  };
+
+  const value = {
+    step,
+    setStep,
+    role,
+    setRole,
+    authMode,
+    setAuthMode,
+    lang,
+    setLang,
+    personal,
+    setPersonal,
+    authPassword,
+    setAuthPassword,
+    rememberMe,
+    setRememberMe,
+    advertiserProfile,
+    setAdvertiserProfile,
+    affiliation,
+    setAffiliation,
+    vehicle,
+    setVehicle,
+    isSubmitting,
+    locationDataLoading,
+    countries,
+    selectedCountry,
+    phonePlaceholder,
+    phoneValidationHint,
+    governorates,
+    districts,
+    canUseDevMockData: isStrictDevelopment,
+    fillRandomRegistrationData,
+    fillCaptainRegistrationData,
+    handlePersonalSubmit,
+    handleVehicleSubmit,
+    handleAdvertiserSubmit,
+    adminCreds,
+    setAdminCreds,
+    handleAdminSubmit,
+    handleLogoTap,
+    createAccountPulseKey,
+  };
+
+  return <RegistrationContext.Provider value={value}>{children}</RegistrationContext.Provider>;
+}
+
+function getLocationLabel(row: SupabaseCountryRow | SupabaseGovernorateRow | SupabaseDistrictRow, lang: 'ar' | 'en') {
+  const preferred = lang === 'ar' ? row.name_ar : row.name_en;
+  return preferred || row.name_ar || row.name_en || row.name || String(row.id);
+}
+
+// Same libphonenumber-js validation the captain onboarding form uses (see
+// src/features/captain/lib/captain-registration-schema.ts), so a phone that's
+// valid in one flow is valid in the other. Local-format numbers (e.g. a
+// leading "0") are accepted as long as a country is selected.
+function normalizePhoneForCountry(
+  rawPhone: string,
+  country: SupabaseCountryRow | null,
+  tAuto?: (key: string) => string,
+) {
+  const trimmed = rawPhone.trim();
+  const getMsg = (key: string, fallback: string) => {
+    try {
+      return tAuto ? tAuto(key) : fallback;
+    } catch {
+      return fallback;
+    }
+  };
+
+  if (!trimmed) {
+    return { ok: false as const, message: getMsg('key_9a6b40b6', 'اكتب رقم الهاتف.') };
+  }
+
+  const isoCode = getCountryIsoCode(country) as CountryCode | undefined;
+
+  try {
+    const parsed = parsePhoneNumberFromString(trimmed, isoCode || undefined);
+    if (!parsed || !parsed.isValid()) {
+      return {
+        ok: false as const,
+        message: isoCode
+          ? getMsg('key_9812501b', 'رقم الهاتف غير صحيح لهذه الدولة، اكتبه بالنسق المحلي أو الدولي.')
+          : getMsg('key_af6d7dd9', 'اختر الدولة أولاً حتى نتحقق من رقم الهاتف.'),
+      };
+    }
+
+    return { ok: true as const, phone: parsed.number };
+  } catch {
+    return { ok: false as const, message: getMsg('key_286d6c55', 'رقم الهاتف غير صحيح.') };
+  }
+}
+
+function toSupabaseAuthRole(role: RegistrationRole): 'RIDER' | 'CAPTAIN' | 'ADVERTISER' | 'DELEGATE' {
+  if (role === 'driver') return 'CAPTAIN';
+  if (role === 'advertiser') return 'ADVERTISER';
+  if (role === 'delegate') return 'DELEGATE';
+  return 'RIDER';
+}
+
+function getDemoPhoneForCountry(country: SupabaseCountryRow | null): string {
+  const isoCode = getCountryIsoCode(country) as CountryCode | undefined;
+  if (isoCode) {
+    const example = getExampleNumber(isoCode, phoneNumberExamples);
+    if (example) return example.number;
+  }
+
+  return '+962790000000';
+}
+
+export function useRegistration() {
+  const context = useContext(RegistrationContext);
+  if (!context) {
+    throw new Error('useRegistration must be used within a RegistrationProvider');
+  }
+  return context;
+}
+

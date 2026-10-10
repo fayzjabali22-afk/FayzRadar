@@ -1,0 +1,179 @@
+'use client';
+
+import { Archive, Bell, History, Home, Languages, LogOut, PlusCircle, User, Download } from 'lucide-react';
+import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+import { Button } from '@/components/ui/button';
+import { useDashboardLanguage } from '@/hooks/use-dashboard-language';
+import type { AppLanguage } from '@/lib/i18n/simple-copy';
+import { cn } from '@/lib/utils';
+import { useTranslations } from "next-intl";
+import { useNotifications } from '@/shared/hooks/use-notifications';
+import { usePwaInstall } from '@/hooks/usePwaInstall';
+
+const styles = {
+  root: 'fixed inset-y-0 start-0 z-[140] hidden w-[288px] flex-col border-e border-white/[0.06] bg-[#0A0F1D]/95 shadow-[22px_0_70px_rgba(0,0,0,0.38)] backdrop-blur-xl lg:flex',
+  profile: 'flex items-center gap-3 border-b border-white/10 p-5',
+  avatar: 'h-12 w-12 border border-[#14B8A6]/35 bg-[#101827]',
+  avatarFallback: 'bg-[#101827] text-sm font-black text-white',
+  identity: 'min-w-0',
+  identityRtl: 'text-right',
+  identityLtr: 'text-left',
+  name: 'truncate text-sm font-black text-white',
+  phone: 'truncate text-xs font-bold text-[#14B8A6]',
+  language: 'ms-auto h-8 shrink-0 gap-1 rounded-lg border border-[#14B8A6]/25 bg-[#14B8A6]/10 px-2 text-[10px] font-black text-[#14F5D5] hover:bg-[#14B8A6]/20 hover:text-[#14F5D5]',
+  languageIcon: 'h-3.5 w-3.5',
+  actions: 'space-y-3 p-4',
+  request: 'h-12 w-full justify-center gap-2 rounded-2xl bg-[#14B8A6] text-sm font-black text-[#031315] shadow-[0_16px_35px_rgba(20,184,166,0.18)] hover:bg-[#2DD4BF]',
+  actionIcon: 'h-5 w-5',
+  notifications: 'h-11 w-full justify-between rounded-2xl border border-white/10 bg-white/[0.04] px-4 text-sm font-bold text-slate-200 hover:bg-white/[0.07]',
+  notificationIcon: 'h-4 w-4 text-[#14B8A6]',
+  navigation: 'flex-1 space-y-2 px-4 pt-2',
+  navItem: 'flex h-12 items-center justify-between rounded-2xl border px-4 text-sm font-black transition',
+  navActive: 'border-[#14B8A6]/35 bg-[#14B8A6]/15 text-[#14F5D5]',
+  navIdle: 'border-transparent text-slate-400 hover:border-white/10 hover:bg-white/[0.04] hover:text-white',
+  navIcon: 'h-5 w-5',
+  footer: 'space-y-3 border-t border-white/10 p-4',
+  logout: 'h-12 w-full justify-center gap-2 rounded-2xl bg-red-600/90 text-sm font-black text-white hover:bg-red-500',
+} as const;
+
+const copy = {
+  ar: {
+    fallbackName: 'راكب',
+    fallbackPhone: 'تطبيق الرحلات',
+    logout: 'تسجيل الخروج',
+    nav: { home: 'الرئيسية', history: 'رحلاتي', profile: 'حسابي', vault: 'الخزنة' },
+    notifications: 'التنبيهات',
+    requestRide: 'اطلب رحلة',
+  },
+  en: {
+    fallbackName: 'Rider',
+    fallbackPhone: 'Ride app',
+    logout: 'Log out',
+    nav: { home: 'Home', history: 'Trips', profile: 'Profile', vault: 'Vault' },
+    notifications: 'Notifications',
+    requestRide: 'Request ride',
+  },
+} satisfies Record<AppLanguage, {
+  fallbackName: string;
+  fallbackPhone: string;
+  logout: string;
+  nav: Record<'home' | 'history' | 'profile' | 'vault', string>;
+  notifications: string;
+  requestRide: string;
+}>;
+
+function initials(value: string) {
+  const words = value.trim().split(/\s+/).filter(Boolean);
+  if (words.length >= 2) return `${words[0]?.[0] || ''}${words[1]?.[0] || ''}`.toUpperCase();
+  return value.slice(0, 2).toUpperCase();
+}
+
+export function DesktopRiderSidebar({
+  hash,
+  language,
+  logout,
+  onNotify,
+  user,
+}: {
+  hash: string;
+  language: AppLanguage;
+  logout: () => void | Promise<void>;
+  onNotify: () => void;
+  user: { name?: string; phone?: string };
+}) {
+  const tAuto = useTranslations('auto');
+  const { isArabic, toggleLanguage } = useDashboardLanguage();
+  const { hasUnread } = useNotifications();
+  const { isStandalone, canPromptNative, triggerNativeInstall, platformEnv } = usePwaInstall();
+  const text = copy[language];
+  const directionClass = language === 'ar' ? styles.identityRtl : styles.identityLtr;
+  const items = [
+    { href: '#', icon: Home, label: text.nav.home },
+    { href: '#history', icon: History, label: text.nav.history },
+    { href: '#vault', icon: Archive, label: text.nav.vault },
+    { href: '#profile', icon: User, label: text.nav.profile },
+  ];
+
+  const openRideRequest = () => {
+    window.location.hash = '#';
+    window.dispatchEvent(new CustomEvent('rider-open-destination'));
+  };
+
+  return (
+    <aside aria-label={tAuto('key_5cbbdfd5')} className={styles.root} dir={language === 'ar' ? 'rtl' : 'ltr'}>
+      <div className={styles.profile}>
+        <Avatar className={styles.avatar}>
+          <AvatarFallback className={styles.avatarFallback}>
+            {initials(user.name || user.phone || 'R')}
+          </AvatarFallback>
+        </Avatar>
+        <div className={cn(styles.identity, directionClass)}>
+          <p className={cn(styles.name, directionClass)}>{user.name || text.fallbackName}</p>
+          <p className={cn(styles.phone, directionClass)}>{user.phone || text.fallbackPhone}</p>
+        </div>
+        <Button
+          aria-label={isArabic ? 'Switch to English' : tAuto('key_60799d01')}
+          className={styles.language}
+          onClick={toggleLanguage}
+          size="sm"
+          title={isArabic ? 'English' : tAuto('key_26b1b2b0')}
+          type="button"
+          variant="ghost"
+        >
+          <Languages className={styles.languageIcon} />
+          <span>{isArabic ? 'EN' : tAuto('key_b4dfa835')}</span>
+        </Button>
+      </div>
+
+      <div className={styles.actions}>
+        <Button className={styles.request} onClick={openRideRequest}>
+          <PlusCircle className={styles.actionIcon} />
+          {text.requestRide}
+        </Button>
+        {(!isStandalone && (canPromptNative || platformEnv.isIOS)) && (
+          <Button
+            className="h-10 w-full justify-center gap-2 rounded-xl border border-[#14B8A6]/30 bg-[#14B8A6]/10 text-[#14F5D5] hover:bg-[#14B8A6]/20 transition-colors"
+            onClick={() => {
+              if (canPromptNative) void triggerNativeInstall();
+              else alert(isArabic ? 'يرجى الضغط على خيارات المتصفح (مشاركة) واختيار "إضافة إلى الشاشة الرئيسية".' : 'Please tap the browser options (Share) and select "Add to Home Screen".');
+            }}
+          >
+            <Download className="h-4 w-4" />
+            {isArabic ? 'تثبيت التطبيق' : 'Install App'}
+          </Button>
+        )}
+        <Button className={styles.notifications} onClick={onNotify} variant="ghost">
+          <span>{text.notifications}</span>
+          <div className="relative flex items-center justify-center">
+            <Bell className={styles.notificationIcon} />
+            {hasUnread && (
+              <span className="absolute -top-1 -end-1 flex h-2.5 w-2.5">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-rose-400 opacity-75" />
+                <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-rose-500 ring-1 ring-[#0A0F1D]" />
+              </span>
+            )}
+          </div>
+        </Button>
+      </div>
+
+      <nav className={styles.navigation}>
+        {items.map(({ href, icon: Icon, label }) => {
+          const active = hash === href || (href === '#' && (hash === '' || hash === '#/'));
+          return (
+            <a className={cn(styles.navItem, active ? styles.navActive : styles.navIdle)} href={href} key={href}>
+              <span>{label}</span>
+              <Icon className={styles.navIcon} />
+            </a>
+          );
+        })}
+      </nav>
+
+      <div className={styles.footer}>
+        <Button className={styles.logout} onClick={() => void logout()}>
+          <LogOut className={styles.actionIcon} />
+          {text.logout}
+        </Button>
+      </div>
+    </aside>
+  );
+}
