@@ -396,7 +396,7 @@ async function startServer() {
 
   // Server-Side Sovereign Cryptographic Integrity Engine
   function generateIntegritySignatureServer(delegateId: string, count: number, referralCode: string, homeDistrict?: string, currentH3Cell?: string) {
-    const SECRET_SALT = "SOVEREIGN_RADAR_ROUTER_SECURE_SALT_2026";
+    const SECRET_SALT = process.env.SOVEREIGN_SECRET_SALT || "SOVEREIGN_RADAR_ROUTER_SECURE_SALT_2026";
     // We bind the signature with the geographical region (homeDistrict & currentH3Cell) to block location forgery!
     const rawString = `${delegateId}:${count}:${referralCode}:${homeDistrict || ''}:${currentH3Cell || ''}:${SECRET_SALT}`;
     let hash = 0;

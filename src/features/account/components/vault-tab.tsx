@@ -5,6 +5,7 @@ import { Heart, MessageCircle, Phone, Trash2, ShieldCheck, HelpCircle, Sparkles 
 import { useTranslations } from 'next-intl';
 import { cn } from '@/lib/utils';
 import { SAMPLE_VAULT_ADS } from '@/features/ads/services/sample-vault-ads';
+import { SOVEREIGN_CONSTANTS } from '@/core/constants/sovereign-protocols';
 const styles = {
   style112_1: "w-full max-w-4xl mx-auto px-4 pb-12 font-sans",
   style112_2: "text-right",
@@ -73,7 +74,7 @@ export function VaultTab() {
  const ad = detailsDict[id];
  if (ad) {
  const savedTime = ad.savedAtTimestamp || now;
- const isExpired = now - savedTime > 20 * 24 * 60 * 60 * 1000;
+ const isExpired = now - savedTime > SOVEREIGN_CONSTANTS.USER_VAULT_LIFETIME_MS;
  if (isExpired) {
  delete detailsDict[id];
  changed = true;

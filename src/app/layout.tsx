@@ -28,9 +28,15 @@ const styles = {
 
 export async function generateMetadata(): Promise<Metadata> {
   const tAuto = await getTranslations();
+  const title = 'Radar System';
+  const description = 'Radar tracking and monitoring system based on Firebase';
   return {
-    title: tAuto('appTitle'),
-    description: tAuto('appDescription'),
+    title,
+    description,
+    openGraph: {
+      title,
+      description,
+    },
     manifest: '/manifest.json',
     icons: {
       icon: [
@@ -42,7 +48,7 @@ export async function generateMetadata(): Promise<Metadata> {
     appleWebApp: {
       capable: true,
       statusBarStyle: 'black-translucent',
-      title: 'Radar',
+      title: 'Radar System',
     },
   };
 }

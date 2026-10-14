@@ -19,6 +19,8 @@ export const SOVEREIGN_CONSTANTS = {
   TRIP_ARCHIVE_PURGE_HOURS: 150,      // Purge archived trips older than this
   TRIP_FORGOTTEN_GRACE_MIN: 30,     // Grace period for auto-terminating forgotten trips
   TRIP_LIFESPAN_EXTENSION_MIN: 30,    // Minutes to add when extending a trip's lifespan
+  USER_VAULT_LIFETIME_MS: 30 * 24 * 60 * 60 * 1000, // 30 days mandatory mechanical purge for cached ads
+  STABILITY_THRESHOLD_MS: 30 * 24 * 60 * 60 * 1000, // 30 days stability threshold for delegate commissions
 
   // 3. معايير الحصص والحدود (Quota)
   QUOTA_MAX_DRIVERS_VISIBLE: 9,       // حصة الراكب: 9 كباتن كحد أقصى في المحيط والمزاد
